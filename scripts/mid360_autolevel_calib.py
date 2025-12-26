@@ -6,7 +6,9 @@ MID360 Auto-level calibration (ROS1)
 import json
 import math
 import os
+import re
 import signal
+import shutil
 import time
 
 import rospy
@@ -56,6 +58,101 @@ def _dump_json(path, obj):
         os.makedirs(d, exist_ok=True)
     with open(path, "w") as f:
         json.dump(obj, f, indent=2, sort_keys=False)
+
+
+def _calc_rotation_matrix_deg_rp(roll_deg, pitch_deg):
+    """
+    Match livox_ros_driver2 convention (same as pub_handler.cpp) with yaw=0:
+      R = Ry(pitch) * Rx(roll)
+    """
+    roll = float(roll_deg) * math.pi / 180.0
+    pitch = float(pitch_deg) * math.pi / 180.0
+    cr = math.cos(roll)
+    sr = math.sin(roll)
+    cp = math.cos(pitch)
+    sp = math.sin(pitch)
+    return [
+        [cp, sr * sp, cr * sp],
+        [0.0, cr, -sr],
+        [-sp, sr * cp, cr * cp],
+    ]
+
+
+def _mat3_mul_vec3(R, v):
+    return [
+        R[0][0] * v[0] + R[0][1] * v[1] + R[0][2] * v[2],
+        R[1][0] * v[0] + R[1][1] * v[1] + R[1][2] * v[2],
+        R[2][0] * v[0] + R[2][1] * v[1] + R[2][2] * v[2],
+    ]
+
+
+def _update_fasterlio_yaml_extrinsic_t(yaml_path, roll_deg, pitch_deg, backup=True):
+    """
+    Update faster-lio mapping/extrinsic_T in-place, and preserve factory value in a comment.
+
+    In faster-lio, extrinsic_T is `lidar_T_wrt_IMU` (lidar origin expressed in IMU frame).
+    If we rotate IMU/LiDAR frames by the same leveling rotation R, translation coordinates should be:
+      T_new = R * T_factory
+    """
+    if not yaml_path:
+        return False
+    if not os.path.exists(yaml_path):
+        raise RuntimeError("faster-lio yaml not found: %s" % yaml_path)
+
+    with open(yaml_path, "r") as f:
+        raw_lines = f.readlines()
+
+    # Repair previously-written literal "\n" sequences (keep file readable as YAML).
+    lines = []
+    for line in raw_lines:
+        if "\\n" in line:
+            parts = line.split("\\n")
+            for j, p in enumerate(parts):
+                if j < len(parts) - 1:
+                    lines.append(p + "\n")
+                else:
+                    if p != "":
+                        lines.append(p)
+        else:
+            lines.append(line)
+
+    idx = None
+    for i, line in enumerate(lines):
+        # match: optional indent + "extrinsic_T: ["
+        if re.match(r"^\s*extrinsic_T\s*:\s*\[", line):
+            idx = i
+            break
+    if idx is None:
+        raise RuntimeError("cannot find 'extrinsic_T:' in %s" % yaml_path)
+
+    # extract list inside [ ... ]
+    m = re.search(r"\[\s*([^\]]+)\s*\]", lines[idx])
+    if not m:
+        raise RuntimeError("failed to parse extrinsic_T list in %s" % yaml_path)
+    raw_items = [x.strip() for x in m.group(1).split(",")]
+    if len(raw_items) < 3:
+        raise RuntimeError("extrinsic_T must have 3 values in %s" % yaml_path)
+    t_factory = [float(raw_items[0]), float(raw_items[1]), float(raw_items[2])]
+
+    R = _calc_rotation_matrix_deg_rp(roll_deg, pitch_deg)
+    t_new = _mat3_mul_vec3(R, t_factory)
+
+    indent = re.match(r"^(\s*)", lines[idx]).group(1)
+    factory_comment = indent + "# factory_extrinsic_T: [%.6f, %.6f, %.6f]\n" % (t_factory[0], t_factory[1], t_factory[2])
+    has_factory_comment = (idx - 1 >= 0) and ("factory_extrinsic_T" in lines[idx - 1])
+
+    if backup:
+        shutil.copyfile(yaml_path, yaml_path + ".bak")
+
+    if not has_factory_comment:
+        lines.insert(idx, factory_comment)
+        idx += 1
+
+    lines[idx] = indent + "extrinsic_T: [%.6f, %.6f, %.6f]\n" % (t_new[0], t_new[1], t_new[2])
+
+    with open(yaml_path, "w") as f:
+        f.writelines(lines)
+    return True
 
 
 def _make_raw_config(base_cfg, lidar_ip=None):
@@ -178,6 +275,9 @@ class Mid360AutoLevelCalibNode(object):
 
         self.output_config_path = rospy.get_param("~output_config_path", "/tmp/MID360_config_autolevel.json")
         self.raw_config_path = rospy.get_param("~raw_config_path", "/tmp/MID360_config_raw_extrinsic0.json")
+        # optional: update faster-lio yaml extrinsic_T in-place (preserve factory value in comment)
+        self.fasterlio_yaml_path = rospy.get_param("~fasterlio_yaml_path", "")
+        self.fasterlio_yaml_backup = bool(rospy.get_param("~fasterlio_yaml_backup", True))
 
         self.start_rviz = bool(rospy.get_param("~start_rviz", False))
         self.rviz_config = rospy.get_param("~rviz_config", "")
@@ -319,6 +419,16 @@ class Mid360AutoLevelCalibNode(object):
         out_cfg = _apply_calib_to_config(base_cfg, roll_deg, pitch_deg, lidar_ip=self.target_lidar_ip)
         _dump_json(self.output_config_path, out_cfg)
         rospy.loginfo("Wrote calibrated config: %s", self.output_config_path)
+
+        if self.fasterlio_yaml_path:
+            rospy.loginfo("Updating faster-lio yaml extrinsic_T: %s", self.fasterlio_yaml_path)
+            _update_fasterlio_yaml_extrinsic_t(
+                self.fasterlio_yaml_path,
+                roll_deg,
+                pitch_deg,
+                backup=self.fasterlio_yaml_backup,
+            )
+            rospy.loginfo("Updated faster-lio yaml done (backup=%s).", str(self.fasterlio_yaml_backup))
 
         # 5) restart driver with calibrated config
         rospy.loginfo("Restarting livox driver with calibrated config")

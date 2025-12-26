@@ -25,6 +25,9 @@
 	<arg name="raw_config_path" default="/tmp/MID360_config_raw_extrinsic0.json"/>
 	<!-- suppress driver stdout/stderr during check+calib stage -->
 	<arg name="quiet_calib_driver" default="true"/>
+	<!-- optional: update faster-lio extrinsic_T in yaml (in-place). Empty means disabled -->
+	<arg name="fasterlio_yaml_path" default="$(find faster_lio)/config/mid360.yaml"/>
+	<arg name="fasterlio_yaml_backup" default="true"/>
 	<!-- optional: if your json contains multiple lidars, set ip to choose one -->
 	<arg name="target_lidar_ip" default=""/>
 
@@ -51,6 +54,8 @@
 		<param name="output_config_path" value="$(arg output_config_path)"/>
 		<param name="raw_config_path" value="$(arg raw_config_path)"/>
 		<param name="quiet_calib_driver" value="$(arg quiet_calib_driver)"/>
+		<param name="fasterlio_yaml_path" value="$(arg fasterlio_yaml_path)"/>
+		<param name="fasterlio_yaml_backup" value="$(arg fasterlio_yaml_backup)"/>
 		<param name="start_rviz" value="$(arg rviz_enable)"/>
 		<param name="rviz_config" value="$(find livox_ros_driver2)/config/display_point_cloud_ROS1.rviz"/>
 		<param name="target_lidar_ip" value="$(arg target_lidar_ip)"/>
