@@ -38,6 +38,41 @@ PubHandler &pub_handler() {
   return handler;
 }
 
+static inline void CalcRotationMatrixDegRPY(const ExtParameter& param, double R[3][3]) {
+  const double roll = static_cast<double>(param.roll) * PI / 180.0;
+  const double pitch = static_cast<double>(param.pitch) * PI / 180.0;
+  const double yaw = static_cast<double>(param.yaw) * PI / 180.0;
+
+  const double cos_roll = cos(roll);
+  const double cos_pitch = cos(pitch);
+  const double cos_yaw = cos(yaw);
+  const double sin_roll = sin(roll);
+  const double sin_pitch = sin(pitch);
+  const double sin_yaw = sin(yaw);
+
+  // Same convention as LidarPubHandler::SetLidarsExtParam()
+  R[0][0] = cos_pitch * cos_yaw;
+  R[0][1] = sin_roll * sin_pitch * cos_yaw - cos_roll * sin_yaw;
+  R[0][2] = cos_roll * sin_pitch * cos_yaw + sin_roll * sin_yaw;
+
+  R[1][0] = cos_pitch * sin_yaw;
+  R[1][1] = sin_roll * sin_pitch * sin_yaw + cos_roll * cos_yaw;
+  R[1][2] = cos_roll * sin_pitch * sin_yaw - sin_roll * cos_yaw;
+
+  R[2][0] = -sin_pitch;
+  R[2][1] = sin_roll * cos_pitch;
+  R[2][2] = cos_roll * cos_pitch;
+}
+
+static inline void RotateVectorInPlace(const double R[3][3], float& x, float& y, float& z) {
+  const double ox = static_cast<double>(x);
+  const double oy = static_cast<double>(y);
+  const double oz = static_cast<double>(z);
+  x = static_cast<float>(R[0][0] * ox + R[0][1] * oy + R[0][2] * oz);
+  y = static_cast<float>(R[1][0] * ox + R[1][1] * oy + R[1][2] * oz);
+  z = static_cast<float>(R[2][0] * ox + R[2][1] * oy + R[2][2] * oz);
+}
+
 void PubHandler::Init() {
 }
 
@@ -122,6 +157,20 @@ void PubHandler::OnLivoxLidarPointCloudCallback(uint32_t handle, const uint8_t d
       imu_data.acc_x = imu->acc_x;
       imu_data.acc_y = imu->acc_y;
       imu_data.acc_z = imu->acc_z;
+
+      // Apply the same extrinsic rotation used for point cloud compensation,
+      // so the IMU data is corrected at the source level (bag/storage layer).
+      {
+        std::unique_lock<std::mutex> lock(self->packet_mutex_);
+        auto it = self->lidar_extrinsics_.find(handle);
+        if (it != self->lidar_extrinsics_.end()) {
+          double R[3][3];
+          CalcRotationMatrixDegRPY(it->second.param, R);
+          RotateVectorInPlace(R, imu_data.gyro_x, imu_data.gyro_y, imu_data.gyro_z);
+          RotateVectorInPlace(R, imu_data.acc_x, imu_data.acc_y, imu_data.acc_z);
+        }
+      }
+
       self->imu_callback_(&imu_data, self->imu_client_data_);
     }
     return;
